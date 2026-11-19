@@ -1,25 +1,34 @@
 #!/usr/bin/env python3
-"""GTA VI trophy rarity forecast — Exophase earn-rate quantiles.
+"""Forecast Exophase earn rates for Grand Theft Auto VI (PS5) trophies.
 
-Entry for make.fun gta6-trophy-rarity-forecast-01. Python 3.13 stdlib only,
-no network, deterministic: the same input always yields the same bytes.
+Entry for make.fun gta6-trophy-rarity-forecast-01 (refit v2, written fresh
+in-session 19 Nov 2026). Python 3.13 standard library only, no network,
+deterministic.
 
-Model (per case, per trophy), in one paragraph: split every observed earn
-rate into the two things that move it — the count of players who earned the
-trophy, E(t), and the count of players Exophase tracks, N(t) — fit each on
-log time, forecast both to the target, and take the median rate as
-E_forecast / N_forecast. Slopes are shrunk toward their trophy-group mean
-(heavy shrinkage when E is small, where the counts are noisy); the story
-chain is forced monotone (Ch1 >= Ch2 >= Ch3 >= Ch4 >= final); the spread is
-an honest sum of a random-walk term, the fit's residual variance, and a
-refresh term for Exophase's own denominator jumps.
+Model (see STRATEGY.md): decompose each rate into E(t)/N(t).
+  - N(t): power-law fit of log N against ln(1+t) over the last 24 h with
+    recency weighting. A flat history means the page is stale, not the
+    world: forecast N as last N times the first observed refresh jump
+    (3868/638, launch night).
+  - E(t): per trophy, weighted fit of log E against ln(1+t), slope shrunk
+    toward the trophy's group mean (weight E/(E+K)), level anchored at the
+    last observed count; counts never decrease, so E_forecast >= 0.9*E_last.
+  - Stale-level correction (new in v2): when the visible history ends in a
+    long flat stretch, the last observed counts are stale-low — players kept
+    earning while Exophase did not refresh (proven 09:11 -> 12:11 UTC 19 Nov:
+    zero change in 3 h; and proxy 04:30 -> live 09:11 shows E grew 1.2-3.4x
+    per trophy group during a frozen page). Correct E_last upward by the
+    group ratio for the stale tail before the checkpoint, capped per group.
+  - Story chain Ch1 >= Ch2 >= Ch3 >= Ch4 >= final, enforced by
+    pool-adjacent-violators with minimal adjustment.
+  - Spread (logit): random walk + fit residual + refresh risk, scaled by
+    SPREAD_SCALE (calibrated on the practice backtest); platinum and 100%
+    trophies get a longer upper tail. Gone Fishing (id 2, 100%) is special:
+    median 99.9, its earners grow with N, so it is never diluted.
 
-Why split E and N: on launch night Exophase refreshed once, 638 -> 3,868
-tracked players, and every rate but the 100% one fell (RULES.txt). A model
-that extrapolates the rate itself cannot see a refresh coming; a model that
-forecasts E and N separately can — when the history is flat (no refresh
-seen yet) it assumes one is pending and sizes N by that first refresh's
-ratio, 3868/638, instead of pretending N stays put.
+Score is mean pinball loss on the logit scale over 55 trophies x 5
+quantiles (0.05/0.25/0.5/0.75/0.95). Output is one compact JSON line per
+case: {"trophies": [{"id": n, "q": [q05, q25, q50, q75, q95]}]}.
 """
 
 import json
@@ -28,118 +37,140 @@ import os
 import sys
 from datetime import datetime, timezone
 
-RELEASE = datetime(2026, 11, 19, tzinfo=timezone.utc)
-Z_SCORES = (-1.645, -0.674, 0.0, 0.674, 1.645)
+RELEASE = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
+Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
 
-# Story chain, in Exophase id order: Ch1, Ch2, Ch3, Ch4, final mission.
-CHAIN_IDS = [3, 4, 5, 6, 7]
-
-# Trophy groups for slope shrinkage: members share a difficulty shape.
-# ids follow Exophase's list order (see the case's own trophies array).
-GROUP_OF = {}
-for _i in (3, 4, 5, 6, 7):
-    GROUP_OF[_i] = "story"
-for _i in (8, 9, 10, 11, 12, 13, 22, 23, 24, 26, 27):
-    GROUP_OF[_i] = "strand"
-for _i in (15, 16, 17, 18, 19, 20, 21, 28, 29, 32, 33, 34, 36, 37,
-           38, 39, 40, 41, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53):
-    GROUP_OF[_i] = "activity"
-for _i in (30, 31, 35, 42, 54, 55):
-    GROUP_OF[_i] = "collect"
-GROUP_OF[1] = "platinum"
-GROUP_OF[14] = "platinum"
-GROUP_OF[2] = "opener"
-
-# First Exophase refresh of launch night: 638 -> 3,868 tracked players
-# (RULES.txt). Used as the pending-refresh scenario when the history shows
-# no refresh yet (N flat): a flat page is a stale page, not a stable one.
-DILUTION_RATIO = 3868.0 / 638.0
-
-# Shrinkage strength: a trophy whose last earned count is E keeps a weight
-# of E / (E + SHRINK_K) on its own slope; the rest goes to its group mean.
-SHRINK_K = 20.0
-# Recency half-life (hours) for the least-squares weights.
-HALF_LIFE_H = 12.0
-# Spread pieces, all on the logit scale (see forecast_spread).
-REFRESH_SIGMA_FLAT = 1.1   # no refresh seen yet: one is pending, size ~ln(6)
-REFRESH_SIGMA_SEEN = 0.45  # refreshes seen: cadence known, jumps smaller
+# --- Tunable constants (calibrated on the practice backtest, see report) ---
+HALF_LIFE_H = 12.0          # recency half-life for fits (hours)
+SHRINK_K = 20.0             # shrinkage weight: w = E / (E + K)
+# SPREAD_SCALE = 0.9 — calibrated 19 Nov on V1+V2+V2b plus two independent
+# 108 h synthetic finals. Scale 1.0 costs ~0.02 on the short-horizon real
+# tests (V1 0.262 / V2 0.266); scale 0.7 would meet the V1 < 0.20 proxy
+# target but costs +0.02-0.04 on the long horizon and collapses coverage
+# there (0.87 at 0.7, 0.62 at 0.6, 0.11 at 0.4). The final is a 108 h
+# case, so the long horizon outranks the proxy: 0.9 keeps long-horizon
+# loss within 0.01 of the best scale while clearly beating v1 on both
+# real-data tests (V1 0.241, V2 0.245).
+SPREAD_SCALE = 0.9          # global spread multiplier (tuned on V1+V2)
+RW_COEF = 0.5               # random-walk sigma per sqrt(day)
+REFRESH_SIGMA_FLAT = 1.1    # refresh risk when N never moved in history
+REFRESH_SIGMA_SEEN = 0.45   # refresh risk when refreshes are visible
 SPREAD_FLOOR = 0.30
 SPREAD_CAP = 2.50
-# Platinum / 100%-completion: the upside tail is longer than the downside
-# (a few hardcore players can finish far sooner than expected).
-UPPER_TAIL_IDS = (1, 14)
-UPPER_TAIL_MULT = 1.35
-LOWER_TAIL_MULT = 0.90
+DELAYED_REFRESH_MULT = 3868.0 / 638.0   # first observed refresh jump
+STALE_WINDOW_H = 6.7        # hours spanned by the proxy->live window
+CHAIN_IDS = [3, 4, 5, 6, 7]
+
+# Shrinkage groups (prior slope is the group mean fit slope).
+SHRINK_GROUPS = {
+    "story": {3, 4, 5, 6, 7},
+    "strand": {8, 9, 10, 11, 12, 13, 22, 23, 24, 26, 27, 37},
+    "activity": {20, 21, 33, 34, 35, 38, 39, 41, 42, 44, 46, 47, 48,
+                 49, 50, 51, 53, 54, 55},
+    "grind": {15, 16, 17, 18, 19, 25, 28, 29, 30, 31, 32, 36, 40, 43,
+              45, 52},
+    "platinum": {1, 14},
+}
+
+# Stale-growth priors: (E-growth ratio per STALE_WINDOW_H, cap).
+# From research/live-rates-2026-11-19T1211Z.md: rate ratios proxy 04:30
+# -> live 09:11 UTC are lower bounds on E growth while the page was
+# frozen (N can only grow, so E grew at least by the rate ratio).
+STALE_GROUPS = {
+    "early": ({3}, 2.33, 3.0),
+    "story": ({4, 5, 6, 7}, 1.28, 2.0),
+    "strand": ({8, 9, 10, 11, 12, 13, 22, 23, 24, 26, 27, 37}, 1.28, 2.0),
+    "fast": ({20, 21, 35}, 2.57, 4.0),
+    "activity": ({33, 34, 38, 39, 41, 42, 44, 46, 47, 48, 49, 50, 51,
+                  53, 54, 55}, 1.24, 2.0),
+    "floor": ({1, 14, 15, 16, 17, 18, 19, 25, 28, 29, 30, 31, 32, 36, 40,
+               43, 45, 52}, 1.00, 1.0),
+}
 
 
-def parse_time(text):
-    """ISO-8601 UTC timestamp -> aware datetime."""
-    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+def _group_of(tid, table):
+    for name, members in table.items():
+        if tid in members:
+            return name
+    return None
+
+
+def parse_time(value):
+    """Parse an ISO-8601 timestamp (with 'Z') into an aware datetime."""
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def hours_since_release(moment):
-    """Hours from the 2026-11-19T00:00Z release to a read/target."""
-    delta = (moment - RELEASE).total_seconds() / 3600.0
-    return max(delta, -0.9)
+    """Hours from the 2026-11-19T00:00:00Z release to a datetime."""
+    return (moment - RELEASE).total_seconds() / 3600.0
+
+
+def _clamp_rate(rate):
+    return min(max(float(rate), 0.01), 99.99)
 
 
 def logit_pct(rate):
-    """logit of a percent rate, clamped to the scorer's [0.01, 99.99]."""
-    p = min(max(rate, 0.01), 99.99) / 100.0
+    """logit of a percentage rate, clamped to [0.01, 99.99]."""
+    p = _clamp_rate(rate) / 100.0
     return math.log(p / (1.0 - p))
 
 
-def inv_logit_pct(logit_value):
-    """Inverse logit -> percent, clamped to the scorer's range."""
-    if logit_value >= 20.0:
+def inv_logit_pct(value):
+    """Inverse logit back to a percentage, clamped to [0.01, 99.99]."""
+    if value > 30.0:
         return 99.99
-    if logit_value <= -20.0:
+    if value < -30.0:
         return 0.01
-    return 100.0 / (1.0 + math.exp(-logit_value))
+    return _clamp_rate(100.0 / (1.0 + math.exp(-value)))
 
 
 def weighted_line(xs, ys, ws):
-    """Weighted least squares y ~ a + b*x. Returns (slope, intercept)."""
-    sw = sum(ws)
-    if sw <= 0.0 or len(xs) < 2:
-        return 0.0, (ys[-1] if ys else 0.0)
-    mx = sum(w * x for w, x in zip(ws, xs)) / sw
-    my = sum(w * y for w, y in zip(ws, ys)) / sw
-    sxx = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs))
-    if sxx <= 1e-12:
-        return 0.0, my
-    sxy = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys))
-    slope = sxy / sxx
-    return slope, my - slope * mx
+    """Weighted least squares y ~ a + b*x; returns (slope, intercept)."""
+    total_w = sum(ws)
+    if total_w <= 0.0 or len(xs) == 0:
+        return 0.0, (sum(ys) / len(ys) if ys else 0.0)
+    mean_x = sum(w * x for w, x in zip(ws, xs)) / total_w
+    mean_y = sum(w * y for w, y in zip(ws, ys)) / total_w
+    num = sum(w * (x - mean_x) * (y - mean_y)
+              for w, x, y in zip(ws, xs, ys))
+    den = sum(w * (x - mean_x) ** 2 for w, x in zip(ws, xs))
+    if den <= 1e-12:
+        return 0.0, mean_y
+    slope = num / den
+    return slope, mean_y - slope * mean_x
 
 
 def median_of(values):
-    """Median of a non-empty list of floats."""
+    """Plain median of a non-empty list of numbers."""
     ordered = sorted(values)
-    n = len(ordered)
-    mid = n // 2
-    if n % 2:
+    count = len(ordered)
+    mid = count // 2
+    if count % 2:
         return ordered[mid]
     return 0.5 * (ordered[mid - 1] + ordered[mid])
 
 
 def pool_adjacent_decreasing(values):
-    """Isotonic regression (decreasing) by pool-adjacent-violators.
-
-    Returns the closest non-increasing sequence in the least-squares sense,
-    used to keep the story-chain medians monotone with minimal adjustment.
-    """
-    blocks = [[v, 1] for v in values]
-    i = 0
-    while i + 1 < len(blocks):
-        if blocks[i][0] < blocks[i + 1][0]:
-            merged = blocks[i][0] * blocks[i][1] + blocks[i + 1][0] * blocks[i + 1][1]
-            count = blocks[i][1] + blocks[i + 1][1]
-            blocks[i:i + 2] = [[merged / count, count]]
-            if i:
-                i -= 1
+    """Isotonic regression (non-increasing) via pool-adjacent-violators."""
+    blocks = [[value, 1] for value in values]
+    index = 0
+    while index < len(blocks) - 1:
+        if blocks[index][0] < blocks[index + 1][0]:
+            merged_value = ((blocks[index][0] * blocks[index][1]
+                             + blocks[index + 1][0] * blocks[index + 1][1])
+                            / (blocks[index][1] + blocks[index + 1][1]))
+            merged_count = blocks[index][1] + blocks[index + 1][1]
+            blocks[index:index + 2] = [[merged_value, merged_count]]
+            if index > 0:
+                index -= 1
         else:
-            i += 1
+            index += 1
     out = []
     for value, count in blocks:
         out.extend([value] * count)
@@ -147,264 +178,292 @@ def pool_adjacent_decreasing(values):
 
 
 def read_series(case):
-    """Build per-trophy time series from a case's history.
+    """Split a case into time series.
 
-    Returns (times, n_series, per-trophy series) where times are hours
-    since release, n_series the tracked-player counts, and each trophy's
-    series a list of (time, rate) with null rates dropped.
+    Returns (times, n_series, raw): times are hours since release for each
+    history read, n_series the players-tracked per read, raw maps trophy
+    position (0-based, same order as case["trophies"]) to a list of
+    (time, rate) pairs with non-null rates.
     """
     history = case.get("history") or []
-    times = []
-    n_series = []
-    raw = {}
+    rows = []
     for read in history:
-        try:
-            moment = parse_time(read["at"])
-        except (KeyError, TypeError, ValueError):
+        stamp = read.get("at") or read.get("slot")
+        if stamp is None:
             continue
-        times.append(hours_since_release(moment))
-        n_series.append(float(read.get("players_tracked") or 0) or None)
-        rates = read.get("rates") or []
-        for pos, rate in enumerate(rates):
-            if rate is None:
-                continue
-            raw.setdefault(pos, []).append((times[-1], float(rate)))
+        rows.append((hours_since_release(parse_time(stamp)), read))
+    rows.sort(key=lambda item: item[0])
+    times = [t for t, _ in rows]
+    n_series = [read.get("players_tracked") for _, read in rows]
+    raw = {}
+    trophies = case.get("trophies") or []
+    for pos in range(len(trophies)):
+        series = []
+        for t, read in rows:
+            rates = read.get("rates") or []
+            if pos < len(rates) and rates[pos] is not None:
+                series.append((t, float(rates[pos])))
+        if series:
+            raw[pos] = series
     return times, n_series, raw
 
 
 def forecast_n(times, n_series, target_t):
-    """Forecast tracked players at the target hour.
+    """Forecast players-tracked N at target_t; returns (n_forecast, flat).
 
-    Power law: log N ~ a + b * ln(1 + t), fitted on the last 24 h of reads
-    (recency-weighted). When N never moved, a refresh is pending: scale by
-    the first launch-night refresh instead of pretending N stays put.
-    Returns (n_forecast, n_flat) with n_flat True when N never changed.
+    flat is True when N never moved in the visible history.
     """
     pairs = [(t, n) for t, n in zip(times, n_series) if n and n > 0]
     if not pairs:
         return 1.0, True
-    distinct = {n for _, n in pairs}
     n_last = pairs[-1][1]
-    if len(distinct) < 2:
-        return n_last * DILUTION_RATIO, True
-    cutoff = pairs[-1][0] - 24.0
-    window = [(t, n) for t, n in pairs if t >= cutoff]
-    if len({n for _, n in window}) < 2:
+    values = [n for _, n in pairs]
+    if max(values) == min(values):
+        # Page frozen: a refresh is overdue. The first observed refresh
+        # multiplied N by 3868/638, so forecast that jump, not flat N.
+        return float(n_last) * DELAYED_REFRESH_MULT, True
+    t_max = max(t for t, _ in pairs)
+    window = [(t, n) for t, n in pairs if t >= t_max - 24.0]
+    if len(window) < 2:
         window = pairs
-    t_last = pairs[-1][0]
-    xs = [math.log1p(max(t, -0.9)) for t, _ in window]
+    xs = [math.log1p(t) for t, _ in window]
     ys = [math.log(n) for _, n in window]
-    ws = [0.5 ** ((t_last - t) / HALF_LIFE_H) for t, _ in window]
+    ws = [0.5 ** ((t_max - t) / HALF_LIFE_H) for t, _ in window]
     slope, intercept = weighted_line(xs, ys, ws)
     slope = min(max(slope, 0.0), 2.0)
-    x_target = math.log1p(max(target_t, -0.9))
-    n_forecast = math.exp(intercept + slope * x_target)
-    n_forecast = min(max(n_forecast, n_last), n_last * 100.0)
-    return n_forecast, False
+    n_forecast = math.exp(intercept + slope * math.log1p(max(target_t, 0.0)))
+    return max(n_forecast, float(n_last)), False
+
+
+def _fit_log_e(series, n_pairs):
+    """Fit log E against ln(1+t); returns (slope, e_last, t_last, resid).
+
+    E = rate * N / 100 per read. Returns None when the series carries no
+    usable point.
+    """
+    by_time = {}
+    for t, n in n_pairs:
+        by_time[t] = n
+    points = []
+    for t, rate in series:
+        n = by_time.get(t)
+        if n is None or n <= 0:
+            continue
+        earned = max(rate * n / 100.0, 0.5)
+        points.append((t, math.log(earned), earned))
+    if not points:
+        return None
+    t_last = points[-1][0]
+    e_last = points[-1][2]
+    if len(points) < 2:
+        return 0.0, e_last, t_last, 0.0
+    xs = [math.log1p(t) for t, _, _ in points]
+    ys = [y for _, y, _ in points]
+    ws = [0.5 ** ((t_last - t) / HALF_LIFE_H) for t, _, _ in points]
+    slope, intercept = weighted_line(xs, ys, ws)
+    resid = sum(w * (y - (intercept + slope * x)) ** 2
+                for w, x, y in zip(ws, xs, ys)) / max(sum(ws), 1e-9)
+    return slope, e_last, t_last, min(max(resid, 0.0), 4.0)
 
 
 def forecast_trophy_median(series, n_pairs, n_forecast, target_t,
-                            group_slope):
-    """Median earn rate for one trophy at the target, via E/N split.
+                           prior_slope):
+    """Forecast one trophy's median rate; returns (median, resid_var).
 
-    series: [(time, rate)] for this trophy. n_pairs: [(time, N)].
-    Fits log E ~ a + b * ln(1 + t) (E = rate * N / 100), shrinks the slope
-    toward the trophy's group mean, anchors the level at the last read,
-    and divides the forecast count by the forecast N.
+    Log-E slope is shrunk toward prior_slope with weight E/(E+K); the
+    level is anchored at the last observed count, and E never decreases.
     """
-    if not series:
+    fit = _fit_log_e(series, n_pairs)
+    if fit is None:
         return None
-    t_last, rate_last = series[-1]
-    n_last = None
-    for t, n in reversed(n_pairs):
-        if n and n > 0:
-            n_last = n
-            break
-    if n_last is None:
-        return None
-    e_last = max(rate_last * n_last / 100.0, 0.5)
-    xs, ys, ws = [], [], []
-    for t, rate in series:
-        n_at = None
-        for tt, nn in n_pairs:
-            if abs(tt - t) < 1e-9:
-                n_at = nn
-                break
-        if not n_at:
-            continue
-        e_at = max(rate * n_at / 100.0, 0.5)
-        xs.append(math.log1p(max(t, -0.9)))
-        ys.append(math.log(e_at))
-        ws.append(0.5 ** ((t_last - t) / HALF_LIFE_H))
-    slope = 0.0
-    resid_var = 0.0
-    if len(xs) >= 2:
-        slope, intercept = weighted_line(xs, ys, ws)
-        resid = [y - (intercept + slope * x) for x, y in zip(xs, ys)]
-        resid_var = sum(w * r * r for w, r in zip(ws, resid)) / max(sum(ws), 1e-9)
-        resid_var = min(max(resid_var, 0.0), 4.0)
+    slope_fit, e_last, t_last, resid_var = fit
     weight = e_last / (e_last + SHRINK_K)
-    slope = weight * slope + (1.0 - weight) * group_slope
-    slope = min(max(slope, -0.05), 2.0)
-    x_target = math.log1p(max(target_t, -0.9))
-    x_last = math.log1p(max(t_last, -0.9))
-    e_forecast = e_last * math.exp(slope * (x_target - x_last))
-    e_forecast = max(e_forecast, e_last * 0.9)
-    median = 100.0 * e_forecast / n_forecast
+    slope = weight * slope_fit + (1.0 - weight) * prior_slope
+    slope = min(max(slope, -2.0), 2.0)
+    growth = math.exp(slope * (math.log1p(max(target_t, 0.0))
+                               - math.log1p(max(t_last, 0.0))))
+    e_forecast = max(e_last * growth, 0.9 * e_last)
+    median = _clamp_rate(100.0 * e_forecast / max(n_forecast, 1.0))
     return median, resid_var
+
+
+def stale_boost(tid, stale_hours):
+    """Level correction for a trophy whose history ends in a flat stretch.
+
+    While the page is frozen, earners keep growing unseen; the group ratio
+    (lower bound from the proxy->live window) corrects E_last upward for
+    the stale tail only, capped per group. No boost for short tails.
+    """
+    if stale_hours <= 1.0:
+        return 1.0
+    for _name, (members, ratio, cap) in STALE_GROUPS.items():
+        if tid in members:
+            if ratio <= 1.0:
+                return 1.0
+            return min(cap, ratio ** (stale_hours / STALE_WINDOW_H))
+    return 1.0
 
 
 def forecast_spread(horizon_days, resid_var, n_flat):
     """Honest logit spread: random walk + fit residual + refresh risk."""
-    random_walk = 0.5 * math.sqrt(max(horizon_days, 0.0))
+    walk = RW_COEF * math.sqrt(max(horizon_days, 0.0))
     refresh = REFRESH_SIGMA_FLAT if n_flat else REFRESH_SIGMA_SEEN
-    var = random_walk ** 2 + resid_var + refresh ** 2
-    return min(max(math.sqrt(var), SPREAD_FLOOR), SPREAD_CAP)
+    resid = min(max(resid_var, 0.0), 4.0)
+    base = math.sqrt(walk * walk + resid + refresh * refresh)
+    spread = base * SPREAD_SCALE
+    return min(max(spread, SPREAD_FLOOR), SPREAD_CAP)
 
 
-def quantiles_for(median, spread, trophy_id):
-    """Five quantiles at levels .05/.25/.5/.75/.95 from a logit median."""
+def quantiles_for(median, spread, tid):
+    """Five quantiles around a median; platinum/100% get a longer top."""
     centre = logit_pct(median)
-    if trophy_id in UPPER_TAIL_IDS:
-        spread_up = spread * UPPER_TAIL_MULT
-        spread_down = spread * LOWER_TAIL_MULT
-    else:
-        spread_up = spread_down = spread
     out = []
-    for z in Z_SCORES:
-        s = spread_up if z > 0 else (spread_down if z < 0 else spread)
-        value = inv_logit_pct(centre + z * s)
-        out.append(round(min(max(value, 0.01), 99.99), 4))
-    for k in range(1, len(out)):
-        out[k] = max(out[k], out[k - 1])
+    previous = 0.0
+    for z in Z:
+        width = spread
+        if tid in (1, 14):
+            width = spread * (1.35 if z > 0 else 0.90 if z < 0 else 1.0)
+        value = round(inv_logit_pct(centre + z * width), 4)
+        value = max(value, previous)
+        out.append(value)
+        previous = value
     return out
 
 
-def persistence_row(rate, horizon_days, n_flat):
-    """Fallback row: last rate with the baseline random-walk spread."""
-    spread = forecast_spread(horizon_days, 0.0, n_flat)
-    return quantiles_for(rate, spread, 0)
-
-
 def forecast_case(case):
-    """Forecast one case -> {"trophies": [{"id": n, "q": [...]}]}."""
+    """Forecast every trophy in one case; returns {"trophies": [...]}."""
     trophies = case.get("trophies") or []
-    horizon_days = float(case.get("horizon_minutes") or 0) / 1440.0
-    target_t = hours_since_release(parse_time(case["target"]))
+    if not trophies:
+        return {"trophies": []}
     times, n_series, raw = read_series(case)
-    n_pairs = [(t, n) for t, n in zip(times, n_series) if n and n > 0]
+    target_raw = case.get("target")
+    target_t = (hours_since_release(parse_time(target_raw))
+                if target_raw else (times[-1] if times else 0.0))
+    at_raw = case.get("at")
+    checkpoint_t = (hours_since_release(parse_time(at_raw))
+                    if at_raw else (times[-1] if times else 0.0))
+    horizon_days = float(case.get("horizon_minutes") or 0) / 1440.0
+    if horizon_days <= 0.0 and target_t > checkpoint_t:
+        horizon_days = (target_t - checkpoint_t) / 24.0
     n_forecast, n_flat = forecast_n(times, n_series, target_t)
+    n_pairs = [(t, n) for t, n in zip(times, n_series) if n and n > 0]
 
-    # Group slopes first (median of member slopes on log E), for shrinkage.
-    member_slopes = {}
-    for pos, series in raw.items():
-        trophy = trophies[pos] if pos < len(trophies) else {}
-        tid = trophy.get("id", pos + 1)
-        group = GROUP_OF.get(tid, "activity")
-        xs, ys = [], []
-        for t, rate in series:
-            n_at = next((nn for tt, nn in n_pairs if abs(tt - t) < 1e-9), None)
-            if not n_at:
-                continue
-            xs.append(math.log1p(max(t, -0.9)))
-            ys.append(math.log(max(rate * n_at / 100.0, 0.5)))
-        if len(xs) >= 2:
-            slope, _ = weighted_line(xs, ys, [1.0] * len(xs))
-            member_slopes.setdefault(group, []).append(slope)
-    group_slopes = {g: median_of(v) for g, v in member_slopes.items() if v}
-    global_slope = median_of([s for v in member_slopes.values() for s in v]) \
-        if member_slopes else 0.0
-
-    medians = {}
-    resid_vars = {}
-    tier_medians = {}
+    # Pass 1: unshrunk log-E slopes, for the group priors.
+    fitted_slope = {}
     for pos, trophy in enumerate(trophies):
         tid = trophy.get("id", pos + 1)
-        series = raw.get(pos, [])
-        if not series:
-            medians[tid] = None
-            resid_vars[tid] = 0.0
+        if tid == 2:
             continue
-        group = GROUP_OF.get(tid, "activity")
-        g_slope = group_slopes.get(group, global_slope)
-        got = forecast_trophy_median(series, n_pairs, n_forecast,
-                                     target_t, g_slope)
+        fit = _fit_log_e(raw.get(pos, []), n_pairs)
+        if fit is not None:
+            fitted_slope[tid] = fit[0]
+    group_prior = {}
+    for name, members in SHRINK_GROUPS.items():
+        slopes = [fitted_slope[t] for t in members if t in fitted_slope]
+        group_prior[name] = sum(slopes) / len(slopes) if slopes else 0.0
+
+    # Pass 2: medians with shrinkage, then the stale-level correction.
+    medians = {}
+    resid_vars = {}
+    for pos, trophy in enumerate(trophies):
+        tid = trophy.get("id", pos + 1)
+        if tid == 2:
+            continue
+        group = _group_of(tid, SHRINK_GROUPS)
+        prior = group_prior.get(group, 0.0) if group else 0.0
+        got = forecast_trophy_median(raw.get(pos, []), n_pairs,
+                                     n_forecast, target_t, prior)
         if got is None:
-            medians[tid] = None
-            resid_vars[tid] = 0.0
             continue
-        median, resid_var = got
-        medians[tid] = min(max(median, 0.01), 99.99)
-        resid_vars[tid] = resid_var
-        tier_medians.setdefault(trophy.get("tier", "bronze"), []).append(medians[tid])
+        med, resid = got
+        medians[tid] = med
+        resid_vars[tid] = resid
+        series = raw.get(pos, [])
+        if series:
+            last_change = series[0][0]
+            previous_rate = series[0][1]
+            for t, rate in series[1:]:
+                if rate != previous_rate:
+                    last_change = t
+                    previous_rate = rate
+            stale_hours = checkpoint_t - last_change
+            boost = stale_boost(tid, stale_hours)
+            if boost > 1.0:
+                medians[tid] = _clamp_rate(med * boost)
 
-    # Trophies with no usable read fall back to their tier's median.
-    for tid, value in medians.items():
-        if value is None:
-            trophy = next((t for t in trophies if t.get("id") == tid), {})
-            tier = trophy.get("tier", "bronze")
-            pool = tier_medians.get(tier) or [v for v in medians.values()
-                                              if v is not None]
-            medians[tid] = median_of(pool) if pool else 0.1
+    # Fallback for trophies with no usable series: their tier median.
+    for pos, trophy in enumerate(trophies):
+        tid = trophy.get("id", pos + 1)
+        if tid in medians or tid == 2:
+            continue
+        tier = trophy.get("tier", "bronze")
+        pool = [medians[t] for t in medians
+                if trophies[t - 1].get("tier", "bronze") == tier]
+        if not pool:
+            pool = [v for v in medians.values()]
+        medians[tid] = median_of(pool) if pool else 0.1
+        resid_vars[tid] = 0.0
 
-    # Story chain monotone: Ch1 >= Ch2 >= Ch3 >= Ch4 >= final.
-    chain_present = [tid for tid in CHAIN_IDS if tid in medians]
-    if len(chain_present) >= 2:
-        fixed = pool_adjacent_decreasing([medians[tid] for tid in chain_present])
-        for tid, value in zip(chain_present, fixed):
+    # Story chain must not increase: Ch1 >= Ch2 >= Ch3 >= Ch4 >= final.
+    chain = [t for t in CHAIN_IDS if t in medians]
+    if len(chain) >= 2:
+        fixed = pool_adjacent_decreasing([medians[t] for t in chain])
+        for tid, value in zip(chain, fixed):
             medians[tid] = value
 
     rows = []
     for pos, trophy in enumerate(trophies):
-        tid = trophy.get("id")
+        tid = trophy.get("id", pos + 1)
         series = raw.get(pos, [])
         last_rate = series[-1][1] if series else 0.0
         if tid == 2 and last_rate >= 99.0:
-            # Gone Fishing: every tracked player completes the opener, so
-            # its earners grow with N instead of staying frozen — the rate
-            # stays ~100% through a refresh. Median ~99.9, q05 ~97.
             rows.append({"id": tid, "q": quantiles_for(99.9, 2.0, tid)})
             continue
-        spread = forecast_spread(horizon_days, resid_vars.get(tid, 0.0), n_flat)
+        spread = forecast_spread(horizon_days, resid_vars.get(tid, 0.0),
+                                 n_flat)
         rows.append({"id": tid,
-                     "q": quantiles_for(medians[tid], spread, tid)})
-    rows.sort(key=lambda r: r["id"])
+                     "q": quantiles_for(medians.get(tid, 0.1), spread, tid)})
+    rows.sort(key=lambda row: row["id"])
+    return {"trophies": rows}
+
+
+def _persistence_fallback(case):
+    """Never crash a case: persistence median with a wide honest spread."""
+    trophies = case.get("trophies") or []
+    horizon_days = float(case.get("horizon_minutes") or 0) / 1440.0
+    _, _, raw = read_series(case)
+    spread = forecast_spread(horizon_days, 0.0, True)
+    rows = []
+    for pos, trophy in enumerate(trophies):
+        tid = trophy.get("id", pos + 1)
+        series = raw.get(pos, [])
+        last_rate = series[-1][1] if series else 0.1
+        if tid == 2 and last_rate >= 99.0:
+            rows.append({"id": tid, "q": quantiles_for(99.9, 2.0, tid)})
+        else:
+            rows.append({"id": tid,
+                         "q": quantiles_for(last_rate, spread, tid)})
+    rows.sort(key=lambda row: row["id"])
     return {"trophies": rows}
 
 
 def main():
-    in_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-    os.makedirs(out_dir, exist_ok=True)
-    names = sorted(f for f in os.listdir(in_dir) if f.endswith(".in"))
-    for name in names:
-        case_id = name[:-3]
-        out_path = os.path.join(out_dir, case_id + ".out")
+    input_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    os.makedirs(output_dir, exist_ok=True)
+    for name in sorted(os.listdir(input_dir)):
+        if not name.endswith(".in"):
+            continue
+        with open(os.path.join(input_dir, name)) as handle:
+            case = json.load(handle)
         try:
-            with open(os.path.join(in_dir, name), "r", encoding="utf-8") as fh:
-                case = json.load(fh)
-            result = forecast_case(case)
+            forecast = forecast_case(case)
         except Exception:
-            # Never crash a case: fall back to persistence on the last read.
-            try:
-                with open(os.path.join(in_dir, name), "r",
-                          encoding="utf-8") as fh:
-                    case = json.load(fh)
-                horizon_days = float(case.get("horizon_minutes") or 0) / 1440.0
-                _, _, raw = read_series(case)
-                trophies = case.get("trophies") or []
-                rows = []
-                for pos, trophy in enumerate(trophies):
-                    series = raw.get(pos, [])
-                    last = series[-1][1] if series else 0.1
-                    rows.append({"id": trophy.get("id", pos + 1),
-                                 "q": persistence_row(last, horizon_days, True)})
-                result = {"trophies": sorted(rows, key=lambda r: r["id"])}
-            except Exception:
-                result = {"trophies": []}
-        text = json.dumps(result, separators=(",", ":"))
-        with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write(text)
+            forecast = _persistence_fallback(case)
+        out_name = name[:-3] + ".out"
+        blob = json.dumps(forecast, separators=(",", ":"))
+        with open(os.path.join(output_dir, out_name), "w") as handle:
+            handle.write(blob)
     return 0
 
 

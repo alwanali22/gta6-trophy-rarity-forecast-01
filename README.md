@@ -28,9 +28,17 @@ and the median rate is E_forecast / N_forecast.
 - **Story chain monotone.** Ch1 ≥ Ch2 ≥ Ch3 ≥ Ch4 ≥ final mission, by
   pool-adjacent-violators with minimal adjustment.
 - **Honest spread.** Random walk + fit residual + a refresh term for
-  Exophase's own denominator jumps; the platinum and 100%-completion
-  trophies get a longer upside tail. Gone Fishing (100% of tracked
-  players) is forecast at ~99.9%, not diluted — its earners grow with N.
+  Exophase's own denominator jumps, scaled 0.9× after calibration on the
+  practice backtest (the final is a 108 h case; the scale is set by the
+  long-horizon tests, not the short-horizon proxy); the platinum and
+  100%-completion trophies get a longer upside tail. Gone Fishing (100%
+  of tracked players) is forecast at ~99.9%, not diluted — its earners
+  grow with N.
+- **Stale-level correction (refit v2).** When the visible history ends in
+  a long flat stretch, the last counts are stale-low: players kept earning
+  while Exophase did not refresh (no change at all 09:11 → 12:11 UTC
+  19 Nov). E is corrected upward by the trophy group's observed growth
+  during the last frozen window (1.2–3.4× per 6.7 h), capped per group.
 
 ## Run it
 
@@ -49,12 +57,12 @@ Reads every `*.in` in the input directory, writes one `*.out` per case:
 |---|---|
 | House baseline (persistence) | 1.69 |
 | Median persistence + wide spread (σ=1.5) | 0.97 |
-| **This model** | **0.25** |
+| **This model (refit v2)** | **0.24** |
 
-Pseudo-final (p01 history → live 09:11 UTC rates): loss 0.29 vs baseline
+Pseudo-final (p01 history → live 09:11 UTC rates): loss 0.24 vs baseline
 1.42; median falls for 54/54 trophies (all but Gone Fishing). Deterministic
 (two runs byte-identical), ~0.05 s per case. Full numbers in
-`BUILD-REPORT-2026-11-19.md` (in the workdir, not shipped in this repo).
+`REFIT-REPORT-2026-11-19.md` (in the workdir, not shipped in this repo).
 
 ## License
 
