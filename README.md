@@ -27,13 +27,26 @@ and the median rate is E_forecast / N_forecast.
   its earned count is small and noisy.
 - **Story chain monotone.** Ch1 ≥ Ch2 ≥ Ch3 ≥ Ch4 ≥ final mission, by
   pool-adjacent-violators with minimal adjustment.
-- **Honest spread.** Random walk + fit residual + a refresh term for
-  Exophase's own denominator jumps, scaled 0.9× after calibration on the
-  practice backtest (the final is a 108 h case; the scale is set by the
-  long-horizon tests, not the short-horizon proxy); the platinum and
-  100%-completion trophies get a longer upside tail. Gone Fishing (100%
-  of tracked players) is forecast at ~99.9%, not diluted — its earners
-  grow with N.
+- **Honest spread — branch mixture (final refit).** Exophase refreshes
+  in jumps, so the predictive distribution is three branches centred
+  at logit(median) ± J and logit(median), J the typical single-refresh
+  |Δ ln N| (prior ln(3868/638) = 1.80), weights (0.10, 0.80, 0.10).
+  The outer quantiles still reach the no-refresh / double-refresh
+  branches ~1.8 logit apart, but the inner quantiles sit inside the
+  dominant branch instead of being smeared across both. Within a
+  branch the logit scale is 0.9 × sqrt(random-walk² + residual²).
+  A 0.00% last rate is treated as censored (half an earner), not zero.
+- **Extrapolation guard (final refit).** A log-E power law fitted on a
+  steep growth phase can explode — on a final-like smoke history built
+  from the live 21 Nov rates it sent Ch1 to 99.99%. The median rate is
+  capped at min(3× the last rate, 60%); the upper quantiles still
+  reach above the cap, so the progression-wave case stays covered.
+- **Fresh data (final refit).** Live snapshot 21 Nov 04:28 UTC: Ch1
+  18.02%, Ch2 3.61%, Ch3 0.07%, platinum and 100% now 0.00%, fishing
+  16.73%. The story chain is spread out, not flat — per-trophy slopes
+  now matter, and shrinkage (K=20) correctly bites only where E is
+  small. Platinum/100% medians belong at the 0.01% floor (guides put
+  the story at ~80 h, the platinum at 200–300 h, vs 168 h to target).
 - **Stale-level correction (refit v2).** When the visible history ends in
   a long flat stretch, the last counts are stale-low: players kept earning
   while Exophase did not refresh (no change at all 09:11 → 12:11 UTC
@@ -57,12 +70,13 @@ Reads every `*.in` in the input directory, writes one `*.out` per case:
 |---|---|
 | House baseline (persistence) | 1.69 |
 | Median persistence + wide spread (σ=1.5) | 0.97 |
-| **This model (refit v2)** | **0.24** |
+| **This model (final refit, 21 Nov)** | **0.15** |
 
-Pseudo-final (p01 history → live 09:11 UTC rates): loss 0.24 vs baseline
-1.42; median falls for 54/54 trophies (all but Gone Fishing). Deterministic
-(two runs byte-identical), ~0.05 s per case. Full numbers in
-`REFIT-REPORT-2026-11-19.md` (in the workdir, not shipped in this repo).
+Pseudo-final (p01 history → live 09:11 UTC rates): loss 0.17 vs baseline
+1.42; median falls for 54/54 trophies (all but Gone Fishing). Long-horizon
+synthetic (logistic-E, 108 h): loss 0.69 vs baseline 0.82. Deterministic
+(two runs byte-identical), ~0.04 s per case. Full numbers in
+`REFIT-REPORT-2026-11-21.md` (in the workdir, not shipped in this repo).
 
 ## License
 
